@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Salvador Transcriber — двухканальное demo</title>
+  <style>
+    body { font: 15px/1.45 system-ui, sans-serif; max-width: 1050px; margin: 2rem auto; padding: 0 1rem; color: #17202a; }
+    fieldset { margin: 1rem 0; border: 1px solid #ccd3da; border-radius: 6px; }
+    label { display: inline-block; margin: .3rem 1rem .3rem 0; }
+    input { padding: .35rem; }
+    button { padding: .5rem .8rem; margin-right: .5rem; }
+    .channels { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .partial { min-height: 3rem; padding: .6rem; background: #f3f5f7; white-space: pre-wrap; }
+    li { margin-bottom: .45rem; }
+    #status { font-weight: 600; }
+    .note { color: #4c5864; }
+    @media (max-width: 700px) { .channels { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>Двухканальная транскрибация</h1>
+  <p class="note">Два независимых mono WAV или raw PCM16LE источника передаются в реальном темпе по разным WebSocket. Каналы в браузере не смешиваются. Для настоящего текста сервер должен работать в режиме OpenAI; fake не генерирует реплики.</p>
+  <fieldset>
+    <legend>Звонок</legend>
+    <label>Call ID <input id="callId" value="demo-call-1" required></label>
+    <label>Hotel ID <input id="hotelId" value="demo-hotel" required></label>
+  </fieldset>
+  <div class="channels">
+    <fieldset>
+      <legend>Guest</legend>
+      <input id="guestFile" type="file" accept=".wav,.pcm,audio/wav">
+      <label>PCM sample rate <input id="guestRate" type="number" value="16000" min="8000" step="8000"></label>
+      <h3>Partial</h3><div id="guestPartial" class="partial">—</div>
+      <h3>Final</h3><ol id="guestFinal"></ol>
+    </fieldset>
+    <fieldset>
+      <legend>Operator</legend>
+      <input id="operatorFile" type="file" accept=".wav,.pcm,audio/wav">
+      <label>PCM sample rate <input id="operatorRate" type="number" value="16000" min="8000" step="8000"></label>
+      <h3>Partial</h3><div id="operatorPartial" class="partial">—</div>
+      <h3>Final</h3><ol id="operatorFinal"></ol>
+    </fieldset>
+  </div>
+  <button id="start" type="button">Запустить звонок</button>
+  <button id="stop" type="button" disabled>Остановить</button>
+  <button id="read" type="button">Прочитать финальную транскрипцию</button>
+  <p id="status">Ожидание файлов</p>
+  <h2>Gaps</h2><ul id="gaps"><li>Нет событий</li></ul>
+  <h2>Сохранённая транскрипция</h2><pre id="stored">—</pre>
+<script>
+"use strict";
+const supportedRates = new Set([8000, 16000, 48000]);
+const frameMs = 20;
+let running = false;
+let stopping = false;
+let channels = {};
+let eventSocket = null;
+const $ = id => document.getElementById(id);
+const status = text => { $("status").textContent = text; };
+const sleep = ms => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+const wsUrl = path => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}`;
+
+async function loadSource(role) {
+  const input = $(`${role}File`);
+  const file = input.files[0];
+  if (!file) throw new Error(`Выберите файл для ${role}`);
+  const buffer = await file.arrayBuffer();
+  if (file.name.toLowerCase().endsWith(".pcm")) {
+    const sampleRate = Number($(`${role}Rate`).value);
+    if (!supportedRates.has(sampleRate)) throw new Error("PCM rate: 8000, 16000 или 48000");
+    if (buffer.byteLength === 0 || buffer.byteLength % 2) throw new Error("PCM16LE должен быть непустым и выровненным");
+    return { pcm: new Uint8Array(buffer), sampleRate };
+  }
+  const context = new AudioContext();
+  try {
+    const decoded = await context.decodeAudioData(buffer.slice(0));
+    if (decoded.numberOfChannels !== 1) throw new Error(`${role}: нужен mono WAV, stereo не сводится`);
+    if (!supportedRates.has(decoded.sampleRate)) throw new Error(`${role}: WAV rate ${decoded.sampleRate} не поддержан`);
+    const samples = decoded.getChannelData(0);
+    const pcm = new Uint8Array(samples.length * 2);
+    const view = new DataView(pcm.buffer);
+    samples.forEach((sample, index) => {
+      const clipped = Math.max(-1, Math.min(1, sample));
+      view.setInt16(index * 2, Math.round(clipped * 32767), true);
+    });
+    return { pcm, sampleRate: decoded.sampleRate };
+  } finally {
+    await context.close();
+  }
+}
+
+function showEvent(event) {
+  if (event.event_type === "transcript_partial") {
+    $(`${event.role}Partial`).textContent = event.text || "—";
+  } else if (event.event_type === "transcript_final") {
+    $(`${event.role}Partial`).textContent = "—";
+    const item = document.createElement("li");
+    item.textContent = `[${event.start_ms}–${event.end_ms} ms, g${event.connection_generation}] ${event.text}`;
+    $(`${event.role}Final`).appendChild(item);
+  } else if (event.event_type === "audio_gap") {
+    if ($("gaps").firstChild?.textContent === "Нет событий") $("gaps").replaceChildren();
+    const item = document.createElement("li");
+    item.textContent = `${event.role}: ${event.reason}, ${event.start_ms}–${event.end_ms} ms, dropped=${event.dropped_frames}`;
+    $("gaps").appendChild(item);
+  } else if (event.event_type === "call_completed") {
+    status("Звонок завершён; финальная транскрипция сохранена");
+  }
+}
+
+function openEvents(callId, hotelId) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsUrl(`/ws/calls/${encodeURIComponent(callId)}/events?hotel_id=${encodeURIComponent(hotelId)}`));
+    socket.onopen = () => resolve(socket);
+    socket.onerror = () => reject(new Error("Не удалось открыть поток событий"));
+    socket.onmessage = message => showEvent(JSON.parse(message.data));
+    socket.onclose = () => { if (running && !stopping) status("Поток событий закрыт"); };
+  });
+}
+
+function openChannel(role, callId, hotelId, source) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsUrl(`/ws/calls/${encodeURIComponent(callId)}/${role}`));
+    socket.onopen = () => socket.send(JSON.stringify({
+      type: "start", hotel_id: hotelId,
+      audio: { encoding: "pcm16le", sample_rate: source.sampleRate, channels: 1, frame_duration_ms: frameMs }
+    }));
+    socket.onmessage = message => {
+      const data = JSON.parse(message.data);
+      if (data.type === "ready") resolve(socket);
+      else if (data.type === "error") reject(new Error(`${role}: ${data.message}`));
+    };
+    socket.onerror = () => reject(new Error(`Ошибка WebSocket ${role}`));
+  });
+}
+
+async function streamRole(role, source) {
+  const socket = channels[role];
+  const frameBytes = source.sampleRate * frameMs / 1000 * 2;
+  const started = performance.now();
+  let frame = 0;
+  for (let offset = 0; offset < source.pcm.byteLength && running; offset += frameBytes) {
+    socket.send(source.pcm.slice(offset, Math.min(offset + frameBytes, source.pcm.byteLength)));
+    frame += 1;
+    await sleep(started + frame * frameMs - performance.now());
+  }
+}
+
+async function stopCall() {
+  if (stopping) return;
+  stopping = true;
+  running = false;
+  $("stop").disabled = true;
+  status("Завершение и дренирование…");
+  const guest = channels.guest;
+  try {
+    if (guest?.readyState === WebSocket.OPEN) {
+      guest.send(JSON.stringify({ type: "stop" }));
+      await sleep(150);
+    } else {
+      await fetch(`/calls/${encodeURIComponent($("callId").value)}/stop`, { method: "POST" });
+    }
+  } catch (error) { status(`Ошибка остановки: ${error.message}`); }
+  Object.values(channels).forEach(socket => socket.close());
+  channels = {};
+  $("start").disabled = false;
+}
+
+$("start").addEventListener("click", async () => {
+  if (running) return;
+  const callId = $("callId").value.trim();
+  const hotelId = $("hotelId").value.trim();
+  if (!callId || !hotelId) { status("Заполните Call ID и Hotel ID"); return; }
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  $("guestFinal").replaceChildren(); $("operatorFinal").replaceChildren();
+  stopping = false;
+  try {
+    const [guest, operator] = await Promise.all([loadSource("guest"), loadSource("operator")]);
+    const created = await fetch("/calls", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ call_id: callId, hotel_id: hotelId })
+    });
+    if (!created.ok) throw new Error(await created.text());
+    eventSocket = await openEvents(callId, hotelId);
+    const [guestSocket, operatorSocket] = await Promise.all([
+      openChannel("guest", callId, hotelId, guest),
+      openChannel("operator", callId, hotelId, operator)
+    ]);
+    channels = { guest: guestSocket, operator: operatorSocket };
+    running = true;
+    status("Передача аудио в реальном темпе…");
+    await Promise.all([streamRole("guest", guest), streamRole("operator", operator)]);
+    if (running) await stopCall();
+  } catch (error) {
+    status(`Ошибка: ${error.message}`);
+    running = false;
+    Object.values(channels).forEach(socket => socket.close());
+    eventSocket?.close();
+    channels = {};
+    $("start").disabled = false;
+    $("stop").disabled = true;
+  }
+});
+$("stop").addEventListener("click", stopCall);
+$("read").addEventListener("click", async () => {
+  const callId = encodeURIComponent($("callId").value.trim());
+  const hotelId = encodeURIComponent($("hotelId").value.trim());
+  const response = await fetch(`/calls/${callId}/transcript?hotel_id=${hotelId}`);
+  $("stored").textContent = JSON.stringify(await response.json(), null, 2);
+});
+</script>
+</body>
+</html>
